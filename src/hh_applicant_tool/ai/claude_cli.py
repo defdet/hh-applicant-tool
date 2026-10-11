@@ -121,6 +121,11 @@ class ChatClaudeCLI:
             time.sleep(delay)
 
     def _run(self, args: list[str], prompt: str) -> subprocess.CompletedProcess:
+        # Вне Docker каталог профиля появляется только после первой записи
+        # конфига, а claude отказывается стартовать в несуществующем cwd
+        if self.cwd:
+            self.cwd.mkdir(parents=True, exist_ok=True)
+
         with self._lock:
             self._wait_rate_limit()
             try:
