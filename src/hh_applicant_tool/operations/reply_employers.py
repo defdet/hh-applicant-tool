@@ -33,11 +33,26 @@ class Namespace(BaseNamespace):
     reply_message: str
     max_pages: int
     only_invitations: bool
+    only_new: bool
+    nudge_unviewed: bool
     dry_run: bool
     use_ai: bool
     system_prompt: str
     message_prompt: str
     period: int
+
+
+# Если модель решит, что отвечать не на что, она пришлет это слово вместо
+# письма. Проверяется по первому слову ответа, регистр не важен
+AI_SKIP_TOKEN = "SKIP"
+
+AI_SKIP_INSTRUCTION = (
+    "Если последнее сообщение работодателя не требует ответа "
+    "(отказ, автоответ, простое уведомление, приглашение без вопросов "
+    "или в переписке вообще нет вопроса к тебе), "
+    f"ответь одним словом {AI_SKIP_TOKEN} и ничем больше. "
+    "В остальных случаях пришли только текст сообщения работодателю."
+)
 
 
 class Operation(BaseOperation):
@@ -72,6 +87,24 @@ class Operation(BaseOperation):
             "-oi",
             "--only-invitations",
             help="Отвечать только на приглашения",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--only-new",
+            "--only-unread",
+            help="Отвечать только в чатах с непрочитанными сообщениями "
+            "(has_new_messages). Учтите, что чтение чата снимает этот флаг "
+            "на стороне hh, поэтому повторный запуск такой чат уже не увидит",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--nudge-unviewed",
+            "--remind",
+            help="Писать и в те чаты, где работодатель еще не открывал отклик "
+            "и никаких сообщений от него не было. Это напоминание о себе, "
+            "а не ответ на вопрос, поэтому по умолчанию выключено",
             default=False,
             action=argparse.BooleanOptionalAction,
         )
@@ -112,6 +145,8 @@ class Operation(BaseOperation):
         self.max_pages = args.max_pages
         self.dry_run = args.dry_run
         self.only_invitations = args.only_invitations
+        self.only_new = args.only_new
+        self.nudge_unviewed = args.nudge_unviewed
 
         self.message_prompt = args.message_prompt
         self.cover_letter_ai = (
@@ -143,6 +178,15 @@ class Operation(BaseOperation):
             return 1
         return self._reply_chats(user=me, resumes=resumes, blacklist=blacklist)
 
+    @staticmethod
+    def _is_ai_skip(message: str) -> bool:
+        """Модель сообщила, что отвечать не на что."""
+        stripped = (message or "").strip().strip("*_`\"'.!").strip()
+        if not stripped:
+            return True
+        first_word = stripped.split(maxsplit=1)[0].strip("*_`\"'.!,:")
+        return first_word.upper() == AI_SKIP_TOKEN
+
     def _reply_chats(
         self,
         user: datatypes.User,
@@ -158,18 +202,19 @@ class Operation(BaseOperation):
             "phone": user.get("phone") or "",
         }
 
-        for negotiation in self.tool.get_negotiations():
+        for negotiation in self.tool.get_negotiations(
+            max_pages=self.max_pages
+        ):
             try:
                 # try:
                 #     self.tool.storage.negotiations.save(negotiation)
                 # except RepositoryError as e:
                 #     logger.exception(e)
 
-                if "resume" not in negotiation:
-                    continue
-
+                # Ключ resume бывает и просто null, а не отсутствует
+                negotiation_resume = negotiation.get("resume") or {}
                 if not (
-                    resume := resume_map.get(negotiation["resume"].get("id"))
+                    resume := resume_map.get(negotiation_resume.get("id"))
                 ):
                     continue
 
@@ -194,6 +239,21 @@ class Operation(BaseOperation):
                 vacancy = negotiation["vacancy"]
                 employer = vacancy.get("employer") or {}
                 salary = vacancy.get("salary") or {}
+
+                # Работодатель мог закрыть чат — сообщение все равно не уйдет,
+                # так что не тратим ни запрос к API, ни вызов модели
+                messaging_status = negotiation.get("messaging_status")
+                if messaging_status and messaging_status != "ok":
+                    logger.debug(
+                        "Чат %s недоступен для записи (messaging_status=%s)",
+                        nid,
+                        messaging_status,
+                    )
+                    continue
+
+                if self.only_new and not negotiation.get("has_new_messages"):
+                    logger.debug("В чате %s нет новых сообщений", nid)
+                    continue
 
                 if employer.get("id") in blacklist:
                     print(
@@ -255,9 +315,23 @@ class Operation(BaseOperation):
                     last_message["author"]["participant_type"] == "employer"
                 )
 
-                if is_employer_message or not negotiation.get(
-                    "viewed_by_opponent"
-                ):
+                # Отвечаем только тогда, когда последнее слово за
+                # работодателем: иначе мы просто пишем вдогонку собственному
+                # отклику, на который еще никто ничего не ответил.
+                # Прежнее поведение (напоминание о себе в непросмотренных
+                # откликах) осталось за флагом --nudge-unviewed
+                needs_reply = is_employer_message or (
+                    self.nudge_unviewed
+                    and not negotiation.get("viewed_by_opponent")
+                )
+
+                if not is_employer_message:
+                    logger.debug(
+                        "В чате %s последнее сообщение наше, отвечать не на что",
+                        nid,
+                    )
+
+                if needs_reply:
                     send_message = ""
                     if self.reply_message:
                         send_message = (
@@ -268,17 +342,27 @@ class Operation(BaseOperation):
                         try:
                             ai_query = (
                                 f"Вакансия: {placeholders['vacancy_name']}\n"
+                                f"Работодатель: {placeholders['employer_name']}\n"
                                 f"История переписки:\n"
                                 + "\n".join(message_history[-10:])
-                                + f"\n\nИнструкция: {self.message_prompt}"
+                                + f"\n\nИнструкция: {self.message_prompt}\n"
+                                + AI_SKIP_INSTRUCTION
                             )
+                            logger.debug("AI query:\n%s", ai_query)
                             send_message = self.cover_letter_ai.complete(
                                 ai_query
                             )
                             logger.debug(f"AI message: {send_message}")
                         except AIError as ex:
                             logger.warning(
-                                f"Ошибка OpenAI для чата {nid}: {ex}"
+                                f"Ошибка AI для чата {nid}: {ex}"
+                            )
+                            continue
+
+                        if self._is_ai_skip(send_message):
+                            print(
+                                "🤖 Отвечать не на что, пропускаем",
+                                vacancy["alternate_url"],
                             )
                             continue
                     else:
@@ -334,6 +418,12 @@ class Operation(BaseOperation):
                             )
                             print("❌ Отмена заявки", vacancy["alternate_url"])
                             continue
+
+                    # Пустой ответ отправлять бессмысленно, а API еще и вернет
+                    # ошибку
+                    if not send_message.strip():
+                        logger.debug("Пустое сообщение для чата %s", nid)
+                        continue
 
                     # Финальная отправка текста
                     if self.dry_run:

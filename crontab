@@ -1,6 +1,13 @@
 # shellcheck disable=all
-PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+# /home/docker/.local/bin нужен ради claude — он ставится в домашний каталог
+PATH=/home/docker/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 SHELL=/bin/bash
+
+# Общие флаги, которые cron подставит во все команды ниже.
+# --no-proxy нужен, когда HTTP_PROXY задан в .env ради claude: hh.ru тогда
+# ходит напрямую, а дочерний процесс claude прокси по-прежнему наследует.
+# Если прокси не используется вовсе, оставьте строку пустой
+HH_FLAGS=--no-proxy
 
 # При старте системы/контейнера
 @reboot /bin/bash /app/startup.sh >> /var/log/cron.log 2>&1
@@ -9,17 +16,23 @@ SHELL=/bin/bash
 # Символ процента в кронтабе нужно экранировать
 # sleep с рандомной задержкой от 1 до 5 минут нужен во-первых чтобы токен обновиться успел, а во
 # вторых, чтобы антиспам не сработал
-0 */5 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool update-resumes >> /var/log/cron.log 2>&1
+0 */5 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool $HH_FLAGS update-resumes >> /var/log/cron.log 2>&1
 
 # Рассылаем отклики
-0 8-21 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool apply-vacancies -l /app/letter.txt -f --excluded-filter 'junior|стажировк|bitrix|ddd|web3|crypto|blockchain|дружн\\w+коллектив|полиграф|open\\s*space|опенспейс|хакатон|конкурс|тестов\\w+ задан|soft skill' >> /var/log/cron.log 2>&1
+0 8-21 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool $HH_FLAGS apply-vacancies -l /app/letter.txt -f --excluded-filter 'junior|стажировк|bitrix|ddd|web3|crypto|blockchain|дружн\\w+коллектив|полиграф|open\\s*space|опенспейс|хакатон|конкурс|тестов\\w+ задан|soft skill' >> /var/log/cron.log 2>&1
+
+# Сопроводительные письма пишет Sonnet 5 через `claude -p`. Закомментируйте
+# строку с рассылкой выше и раскомментируйте эту.
+# --ai-context full отдает модели полное описание вакансии и разобранное резюме,
+# --no-proxy нужен, только если HTTP_PROXY в контейнере задан ради самого claude
+#0 8-21 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool $HH_FLAGS apply-vacancies -f --ai --ai-provider claude --ai-context full --excluded-filter 'junior|стажировк|bitrix' >> /var/log/cron.log 2>&1
 
 # Тест: каждые 5 минут (задержка до 1 минуты, чтобы не накладывались)
-#*/5 * * * * /bin/bash -c 'sleep $((1 + RANDOM \% 59))' && /usr/local/bin/python -m hh_applicant_tool apply-vacancies >> /var/log/cron.log 2>&1
+#*/5 * * * * /bin/bash -c 'sleep $((1 + RANDOM \% 59))' && /usr/local/bin/python -m hh_applicant_tool $HH_FLAGS apply-vacancies >> /var/log/cron.log 2>&1
 
 # Пытаемся обновить токен каждую минуту. В этом нет необходимости, можно закомментировать, так как
 # токен обновляется автоматически при любом запросе
-*/1 * * * * /usr/local/bin/python -m hh_applicant_tool refresh-token
+*/1 * * * * /usr/local/bin/python -m hh_applicant_tool $HH_FLAGS refresh-token
 
 # Раскомментируй, если хочешь удалять чаты с отказами
 #0 */1 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh-applicant-tool clear-negotiations -d >> /var/log/cron.log 2>&1

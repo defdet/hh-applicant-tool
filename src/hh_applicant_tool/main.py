@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import smtplib
 import sqlite3
@@ -31,6 +32,9 @@ from .constants import (
     CONFIG_FILENAME,
     COOKIES_FILENAME,
     DATABASE_FILENAME,
+    DEFAULT_CLAUDE_COMMAND,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CLAUDE_TIMEOUT,
     DEFAULT_OPENAI_CONNECT_TIMEOUT,
     DEFAULT_OPENAI_TIMEOUT,
     DESKTOP_USER_AGENT,
@@ -68,7 +72,11 @@ class BaseNamespace(argparse.Namespace):
     api_delay: float
     user_agent: str
     proxy_url: str
+    no_proxy: bool
+    no_env_proxy: bool
     openai_proxy_url: str
+    ai_no_proxy: bool
+    ai_provider: str | None
     openai_timeout: float
     openai_connect_timeout: float
     operation_run: Callable[[HHApplicantTool, BaseNamespace], None | int] | None
@@ -87,6 +95,13 @@ class HHApplicantTool(MegaTool):
         argparse.RawDescriptionHelpFormatter,
     ):
         pass
+
+    # Значения по умолчанию на случай, если утилита используется как библиотека
+    # и argparse не проставил атрибуты
+    no_proxy: bool = False
+    no_env_proxy: bool = False
+    ai_no_proxy: bool = False
+    ai_provider: str | None = None
 
     @classmethod
     def _create_parser(cls) -> argparse.ArgumentParser:
@@ -130,10 +145,33 @@ class HHApplicantTool(MegaTool):
             help="Прокси, используемый для запросов и авторизации",
         )
         parser.add_argument(
+            "--no-proxy",
+            "--without-proxy",
+            action="store_true",
+            help="Не использовать прокси для запросов к hh.ru: игнорируются и --proxy-url/proxy_url из конфига, и переменные окружения типа HTTPS_PROXY. Настройки прокси для AI не затрагиваются",  # noqa: E501
+        )
+        parser.add_argument(
+            "--no-env-proxy",
+            "--ignore-env-proxy",
+            action="store_true",
+            help="Не наследовать прокси из переменных окружения (HTTP_PROXY и компания) для запросов к hh.ru. Явно заданный --proxy-url продолжит работать",  # noqa: E501
+        )
+        parser.add_argument(
             "--openai-proxy",
             "--ai-proxy",
             dest="openai_proxy_url",
-            help="Отдельный прокси, используемый только для OpenAI чата",
+            help="Отдельный прокси, используемый только для AI (OpenAI чат и дочерний процесс claude)",  # noqa: E501
+        )
+        parser.add_argument(
+            "--ai-no-proxy",
+            "--no-ai-proxy",
+            action="store_true",
+            help="Не использовать прокси для AI, даже если он задан для hh.ru или в окружении",  # noqa: E501
+        )
+        parser.add_argument(
+            "--ai-provider",
+            choices=["openai", "claude"],
+            help="Чем генерировать тексты: HTTP-совместимым с OpenAI API провайдером или локальным Claude Code CLI (`claude -p`). По умолчанию берется из конфига (ai.provider), иначе openai",  # noqa: E501
         )
         parser.add_argument(
             "--openai-timeout",
@@ -179,12 +217,8 @@ class HHApplicantTool(MegaTool):
             "https": proxy_url,
         }
 
-    def _get_proxies(self) -> dict[str, str]:
-        proxy_url = self.proxy_url or self.config.get("proxy_url")
-
-        if proxy_url:
-            return self._proxy_url_to_dict(proxy_url)
-
+    @staticmethod
+    def _get_env_proxies() -> dict[str, str]:
         proxies = {}
         http_env = getenv("HTTP_PROXY") or getenv("http_proxy")
         https_env = getenv("HTTPS_PROXY") or getenv("https_proxy") or http_env
@@ -196,24 +230,62 @@ class HHApplicantTool(MegaTool):
 
         return proxies
 
+    def _resolve_proxies(self, *, apply_no_proxy: bool) -> dict[str, str]:
+        """Прокси для hh.ru.
+
+        {apply_no_proxy} выключает флаги --no-proxy/--no-env-proxy, чтобы AI мог
+        и дальше ходить через общий прокси, когда сам hh.ru ходит напрямую.
+        """
+        if apply_no_proxy and self.no_proxy:
+            return {}
+
+        proxy_url = self.proxy_url or self.config.get("proxy_url")
+
+        if proxy_url:
+            return self._proxy_url_to_dict(proxy_url)
+
+        if apply_no_proxy and self.no_env_proxy:
+            return {}
+
+        return self._get_env_proxies()
+
+    def _get_proxies(self) -> dict[str, str]:
+        return self._resolve_proxies(apply_no_proxy=True)
+
     def _get_openai_proxies(self) -> dict[str, str]:
+        if self.ai_no_proxy:
+            return {}
+
         openai_config = self.config.get("openai", {})
         proxy_url = self.openai_proxy_url or openai_config.get("proxy_url")
         if proxy_url:
             return self._proxy_url_to_dict(proxy_url)
-        return self._get_proxies()
+
+        # --no-proxy сказан про hh.ru, а не про AI
+        return self._resolve_proxies(apply_no_proxy=False)
+
+    @property
+    def _proxy_disabled(self) -> bool:
+        return bool(self.no_proxy or self.no_env_proxy)
 
     def _create_http_session(
         self,
         proxies: dict[str, str],
         *,
         log_label: str,
+        trust_env: bool = True,
     ) -> requests.Session:
         session = requests.Session()
+
+        # requests сам читает HTTP_PROXY/NO_PROXY из окружения, поэтому без
+        # trust_env=False пустой session.proxies ничего бы не отключил
+        session.trust_env = trust_env
 
         if proxies:
             logger.info("Use proxies for %s: %r", log_label, proxies)
             session.proxies = proxies
+        elif not trust_env:
+            logger.info("Proxies disabled for %s", log_label)
 
         session.headers.update({"User-Agent": DESKTOP_USER_AGENT})
         return session
@@ -223,6 +295,7 @@ class HHApplicantTool(MegaTool):
         session = self._create_http_session(
             self._get_proxies(),
             log_label="requests",
+            trust_env=not self._proxy_disabled,
         )
 
         session.cookies = HHOnlyCookieJar(str(self.cookies_file))
@@ -236,6 +309,7 @@ class HHApplicantTool(MegaTool):
         return self._create_http_session(
             self._get_openai_proxies(),
             log_label="OpenAI requests",
+            trust_env=not self.ai_no_proxy,
         )
 
     @cached_property
@@ -307,9 +381,12 @@ class HHApplicantTool(MegaTool):
         return rv
 
     def get_negotiations(
-        self, status: str = "active"
+        self, status: str = "active", max_pages: int | None = None
     ) -> Iterable[api.datatypes.Negotiation]:
         for page in count():
+            if max_pages is not None and page >= max_pages:
+                break
+
             r: dict[str, Any] = self.api_client.get(
                 "/negotiations",
                 page=page,
@@ -384,29 +461,120 @@ class HHApplicantTool(MegaTool):
                 f"Сессионные куки имеют неправильный тип: {type(self.session.cookies)}"
             )
 
-    def get_cover_letter_ai(self, system_prompt: str) -> ai.ChatOpenAI:
+    AI_PURPOSES = ("cover_letter", "vacancy_filter", "captcha")
+
+    def get_cover_letter_ai(self, system_prompt: str) -> ai.ChatClient:
         return self._init_ai_client(system_prompt, purpose="cover_letter")
 
-    def get_vacancy_filter_ai(self, system_prompt: str) -> ai.ChatOpenAI:
+    def get_vacancy_filter_ai(self, system_prompt: str) -> ai.ChatClient:
         return self._init_ai_client(system_prompt, purpose="vacancy_filter")
 
     def get_captcha_ai(self) -> ai.ChatOpenAI:
-        return self._init_ai_client(system_prompt="Что написано на картинке?", purpose="captcha")
+        return self._init_openai_client(
+            system_prompt="Что написано на картинке?", purpose="captcha"
+        )
 
-    def _init_ai_client(self, system_prompt: str, purpose: str) -> ai.ChatOpenAI:
+    def resolve_ai_provider(self, purpose: str) -> str:
+        """Провайдер для конкретной задачи: флаг > конфиг > openai."""
+        if self.ai_provider:
+            return self.ai_provider
 
+        ai_config = self.config.get("ai", {})
+
+        return (
+            ai_config.get(purpose)
+            or ai_config.get("provider")
+            or self.config.get("ai_provider")
+            or "openai"
+        )
+
+    def _init_ai_client(self, system_prompt: str, purpose: str) -> ai.ChatClient:
+        if purpose not in self.AI_PURPOSES:
+            raise ValueError(
+                f"Неизвестная цель AI: {purpose}. "
+                f"Допустимые значения: {list(self.AI_PURPOSES)}"
+            )
+
+        provider = self.resolve_ai_provider(purpose)
+
+        match provider:
+            case "claude":
+                if purpose == "captcha":
+                    # Картинку в `claude -p` не завезли, откатываемся
+                    logger.warning(
+                        "Claude CLI не умеет распознавать капчу, "
+                        "для этого используется секция openai_captcha"
+                    )
+                else:
+                    return self._init_claude_client(system_prompt, purpose)
+            case "openai":
+                pass
+            case _:
+                raise ValueError(
+                    f"Неизвестный AI-провайдер: {provider}. "
+                    "Допустимые значения: openai, claude"
+                )
+
+        return self._init_openai_client(system_prompt, purpose)
+
+    def _init_claude_client(
+        self, system_prompt: str, purpose: str
+    ) -> ai.ChatClaudeCLI:
+        """Настройки берутся из claude_<purpose>, затем из общей секции claude."""
+        shared = self.config.get("claude", {})
+        section = self.config.get(f"claude_{purpose}", {})
+
+        def option(key: str, default: Any = None) -> Any:
+            value = section.get(key)
+            if value is None:
+                value = shared.get(key)
+            return default if value is None else value
+
+        extra_args = option("args", [])
+        if isinstance(extra_args, str):
+            extra_args = shlex.split(extra_args)
+
+        # У claude нет своей секции с прокси по умолчанию, поэтому подхватываем
+        # то же, чем пользуется OpenAI-клиент
+        proxy_url = (
+            self.openai_proxy_url
+            or option("proxy_url")
+            or self.config.get("openai", {}).get("proxy_url")
+        )
+
+        return ai.ChatClaudeCLI(
+            system_prompt=system_prompt,
+            model=option("model", DEFAULT_CLAUDE_MODEL),
+            command=option("command", DEFAULT_CLAUDE_COMMAND),
+            extra_args=list(extra_args),
+            timeout=float(
+                self.openai_timeout
+                or option("timeout")
+                or DEFAULT_CLAUDE_TIMEOUT
+            ),
+            max_retries=int(option("max_retries", 2)),
+            rate_limit=int(option("rate_limit", 0)),
+            proxy_url=None if self.ai_no_proxy else proxy_url,
+            no_proxy=bool(self.ai_no_proxy),
+            # Нейтральный каталог, чтобы claude не подцепил чужой CLAUDE.md
+            cwd=self.config_path,
+        )
+
+    def _init_openai_client(
+        self, system_prompt: str, purpose: str
+    ) -> ai.ChatOpenAI:
         config_sections = {
             "cover_letter": "openai_cover_letter",
             "vacancy_filter": "openai_vacancy_filter",
             "captcha": "openai_captcha",
         }
-        
+
         if purpose not in config_sections:
             raise ValueError(
                 f"Неизвестная цель AI: {purpose}. "
                 f"Допустимые значения: {list(config_sections.keys())}"
             )
-        
+
         config_section = config_sections[purpose]
         c = self.config.get(config_section, {})
         

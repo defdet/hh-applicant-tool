@@ -5,16 +5,39 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # 0 — собрать образ без Claude Code CLI (меньше на ~60МБ)
+        INSTALL_CLAUDE: 1
+        # Прокси для скачивания установщика claude. Значение берется из .env
+        CLAUDE_BUILD_PROXY: ${CLAUDE_BUILD_PROXY:-}
+      # Чтобы host.docker.internal резолвился и на этапе сборки тоже
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
     volumes:
       - .:/app:ro
       - ./config:/app/config:rw
-      # Пробрасываем таймзону хоста
-      - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped
+    # На Linux host.docker.internal не резолвится сам по себе, а он нужен,
+    # чтобы дотянуться до прокси, слушающего на хосте. В Docker Desktop
+    # (Windows/Mac) эта строчка просто ничего не меняет
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Секреты и локальные настройки берем из .env (см. .env.example).
+    # Файл необязательный — без него контейнер тоже стартует
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Это не трогаем
       - CONFIG_DIR=/app/config
-      # Смените или закомментируйте при проблемах
-      - TERM=${TERM}
-      # Если время на сервере отличается
-      # - TZ=Europe/Moscow
+      # Авторизация claude лежит рядом с конфигом hh, чтобы переживать пересборку
+      - CLAUDE_CONFIG_DIR=/app/config/claude
+      # Таймзона контейнера. Проброс /etc/localtime намеренно убран: на Windows
+      # такого файла нет и compose падает
+      - TZ=${TZ:-Europe/Moscow}
+      # Пустой TERM ломает вывод капчи, поэтому есть значение по умолчанию
+      - TERM=${TERM:-xterm-256color}
+      # Токены Claude (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) и прокси
+      # (HTTP_PROXY / HTTPS_PROXY / NO_PROXY) сознательно НЕ перечислены здесь.
+      # Их место — .env: так в контейнер не утечет прокси хоста вида
+      # 127.0.0.1:1081, который изнутри указывает сам на себя

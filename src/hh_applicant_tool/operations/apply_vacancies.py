@@ -39,6 +39,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__package__)
 
+# Сколько символов описания вакансии отдаем AI в режиме --ai-context full
+MAX_DESCRIPTION_LENGTH = 6000
+
 
 class Namespace(BaseNamespace):
     resume_id: str | None
@@ -47,6 +50,7 @@ class Namespace(BaseNamespace):
     force_message: bool
     use_ai: bool
     ai_filter: Literal["heavy", "light", "custom"] | None
+    ai_context: Literal["compact", "full"]
     ai_rate_limit: int
     ai_filter_prompt: str | None
     system_prompt: str
@@ -125,6 +129,12 @@ class Operation(BaseOperation):
             help="Использовать AI для фильтрации вакансий. Режимы: heavy - полный анализ вакансии и резюме, light - быстрый анализ по названию и навыкам, custom - свой системный промпт (--ai-filter-prompt)",
             choices=["heavy", "light", "custom"],
             default=None,
+        )
+        parser.add_argument(
+            "--ai-context",
+            choices=["compact", "full"],
+            default="compact",
+            help="Сколько контекста получает AI при написании сопроводительного письма: compact - название вакансии, работодатель и шапка резюме, full - полное описание вакансии и разобранное резюме (дороже и медленнее, но письма получаются по делу)",  # noqa: E501
         )
         parser.add_argument(
             "--ai-rate-limit",
@@ -370,9 +380,12 @@ class Operation(BaseOperation):
             else None
         )
         self.ai_filter = args.ai_filter
+        self.ai_context = args.ai_context
         self.ai_filter_prompt = args.ai_filter_prompt
         self.vacancy_filter_ai = None
         self._resume_analysis_cache: dict[tuple[str | None, str], str] = {}
+        # AI-фильтр и генератор писем ходят за одной и той же вакансией
+        self._full_vacancy_cache: dict[str, dict | None] = {}
 
         self._apply_vacancies()
 
@@ -401,7 +414,9 @@ class Operation(BaseOperation):
 
                 if "skill_set" in full_resume and full_resume["skill_set"]:
                     parts.append("\n---------- НАВЫКИ ----------")
-                    skills_row = ", ".join(full_resume["skill_set"])
+                    skills_row = ", ".join(
+                        x for x in full_resume["skill_set"] if x
+                    )
                     parts.append(skills_row)
 
                 if "experience" in full_resume:
@@ -446,16 +461,36 @@ class Operation(BaseOperation):
 
         if "skill_set" in full_resume and full_resume["skill_set"]:
             parts.append("Навыки: ")
-            skills_row = ", ".join(full_resume["skill_set"])
+            skills_row = ", ".join(
+                x for x in full_resume["skill_set"] if x
+            )
             parts.append(skills_row)
 
         result = "\n".join(parts)
         self._resume_analysis_cache[cache_key] = result
         return result
 
+    def _get_full_vacancy(self, vacancy_id: str | int) -> dict | None:
+        """Полная вакансия с описанием. None, если HH не отдал."""
+        key = str(vacancy_id)
+
+        if key in self._full_vacancy_cache:
+            return self._full_vacancy_cache[key]
+
+        try:
+            full_vacancy = self.api_client.get(f"/vacancies/{key}")
+        except Exception as ex:
+            logger.warning(
+                "Не удалось получить вакансию %s: %s", key, ex
+            )
+            full_vacancy = None
+
+        self._full_vacancy_cache[key] = full_vacancy
+        return full_vacancy
+
     def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
         try:
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
+            full_vacancy = self._get_full_vacancy(vacancy_id) or {}
             key_skills_data = full_vacancy.get("key_skills") or []
             return ", ".join(
                 s["name"] for s in key_skills_data if s.get("name")
@@ -478,6 +513,10 @@ class Operation(BaseOperation):
         if name:
             parts.append(f"Вакансия: {name}")
 
+        employer_name = (vacancy.get("employer") or {}).get("name")
+        if employer_name:
+            parts.append(f"Работодатель: {employer_name}")
+
         if full_vacancy:
             description = full_vacancy.get("description")
             if description:
@@ -487,6 +526,144 @@ class Operation(BaseOperation):
                 key_skills = self._get_vacancy_key_skills(vacancy["id"])
                 if key_skills:
                     parts.append(f"Ключевые навыки: {key_skills}")
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def _format_salary(salary: dict | None) -> str:
+        if not salary:
+            return ""
+
+        bounds = []
+        if salary.get("from"):
+            bounds.append(f"от {salary['from']}")
+        if salary.get("to"):
+            bounds.append(f"до {salary['to']}")
+
+        if not bounds:
+            return ""
+
+        return " ".join([*bounds, salary.get("currency") or ""]).strip()
+
+    def _build_cover_letter_prompt(
+        self,
+        vacancy: dict,
+        resume: dict,
+        placeholders: dict[str, str],
+    ) -> str:
+        """Промпт для генерации сопроводительного письма."""
+        if self.ai_context == "full":
+            return self._build_cover_letter_prompt_full(
+                vacancy, resume, placeholders
+            )
+
+        return self._build_cover_letter_prompt_compact(placeholders)
+
+    def _build_cover_letter_prompt_compact(
+        self, placeholders: dict[str, str]
+    ) -> str:
+        """Минимум контекста: шапка вакансии и шапка резюме."""
+        return (
+            self.message_prompt
+            + "\n"
+            + "[ВАКАНСИЯ] "
+            + "Название: "
+            + placeholders["vacancy_name"]
+            + ", "
+            + "Работодатель: "
+            + placeholders["employer_name"]
+            + "; "
+            + "[РЕЗЮМЕ] "
+            + "Название: "
+            + placeholders["resume_title"]
+            + ", "
+            + "Ссылка на резюме: "
+            + placeholders["resume_url"]
+            + ", "
+            + "Имя: "
+            + placeholders["first_name"]
+            + ", "
+            + "Фамилия: "
+            + placeholders["last_name"]
+            + ", "
+            + "Телефон: "
+            + placeholders["phone"]
+            + ", "
+            + "Почта: "
+            + placeholders["email"]
+        )
+
+    def _build_cover_letter_prompt_full(
+        self,
+        vacancy: dict,
+        resume: dict,
+        placeholders: dict[str, str],
+    ) -> str:
+        """Полное описание вакансии плюс разобранное резюме."""
+        full_vacancy = (
+            self._get_full_vacancy(vacancy["id"]) if vacancy.get("id") else None
+        ) or {}
+
+        parts = [self.message_prompt, "", "[ВАКАНСИЯ]"]
+        parts.append(f"Название: {placeholders['vacancy_name']}")
+        parts.append(f"Работодатель: {placeholders['employer_name']}")
+
+        area = (full_vacancy.get("area") or vacancy.get("area") or {}).get(
+            "name"
+        )
+        if area:
+            parts.append(f"Регион: {area}")
+
+        salary = self._format_salary(
+            full_vacancy.get("salary") or vacancy.get("salary")
+        )
+        if salary:
+            parts.append(f"Зарплата: {salary}")
+
+        for field_name, label in (
+            ("experience", "Требуемый опыт"),
+            ("employment", "Занятость"),
+            ("schedule", "График"),
+        ):
+            value = (
+                full_vacancy.get(field_name) or vacancy.get(field_name) or {}
+            ).get("name")
+            if value:
+                parts.append(f"{label}: {value}")
+
+        key_skills = ", ".join(
+            s["name"]
+            for s in (full_vacancy.get("key_skills") or [])
+            if s.get("name")
+        )
+        if key_skills:
+            parts.append(f"Ключевые навыки: {key_skills}")
+
+        description = full_vacancy.get("description")
+        if description:
+            # Описание бывает на десятки килобайт, а платить за них незачем
+            parts.append(
+                "Описание: "
+                + shorten(strip_tags(description), MAX_DESCRIPTION_LENGTH)
+            )
+
+        resume_analysis = self._analyze_resume_heavy(resume)
+        parts += [
+            "",
+            "[РЕЗЮМЕ]",
+            resume_analysis
+            or f"Должность: {placeholders['resume_title']}",
+        ]
+
+        parts += [
+            "",
+            "[КОНТАКТЫ]",
+            f"Имя: {placeholders['first_name']}",
+            f"Фамилия: {placeholders['last_name']}",
+            f"Телефон: {placeholders['phone']}",
+            f"Почта: {placeholders['email']}",
+            f"Ссылка на резюме: {placeholders['resume_url']}",
+        ]
 
         return "\n".join(parts)
 
@@ -579,7 +756,7 @@ class Operation(BaseOperation):
     ) -> bool:
         full_vacancy = None
         if vacancy.get("id"):
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy['id']}")
+            full_vacancy = self._get_full_vacancy(vacancy["id"])
 
         vacancy_info = self._build_vacancy_context(
             vacancy,
@@ -1017,33 +1194,9 @@ class Operation(BaseOperation):
                     "response_letter_required"
                 ):
                     if self.cover_letter_ai:
-                        msg = self.message_prompt + "\n"
-                        ## добавляем переменные в контекст AI запроса ##
-                        msg += (
-                            "[ВАКАНСИЯ] "
-                            + "Название: "
-                            + message_placeholders["vacancy_name"] + ", "
-                            + "Работодатель: "
-                            + message_placeholders["employer_name"] + "; "
+                        msg = self._build_cover_letter_prompt(
+                            vacancy, resume, message_placeholders
                         )
-                        msg += (
-                            "[РЕЗЮМЕ] "
-                            + "Название: "
-                            + message_placeholders["resume_title"] + ", "
-                            + "Ссылка на резюме: "
-                            + message_placeholders["resume_url"] + ", "    
-                        )
-                        msg += (
-                            "Имя: "
-                            + message_placeholders["first_name"] + ", "
-                            + "Фамилия: "
-                            + message_placeholders["last_name"] + ", "
-                            + "Телефон: "
-                            + message_placeholders["phone"] + ", "
-                            + "Почта: "
-                            + message_placeholders["email"]
-                        )
-                        ## logger.debug("prompt: %s", msg) ## убираем отладку
                         letter = self.cover_letter_ai.complete(msg)
                     else:
                         letter = (

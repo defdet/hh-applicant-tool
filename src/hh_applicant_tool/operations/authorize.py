@@ -7,6 +7,7 @@ import re
 import typing
 from datetime import datetime
 from http.cookiejar import Cookie
+from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
@@ -18,6 +19,7 @@ except ImportError as exc:
 else:
     _PLAYWRIGHT_IMPORT_ERROR = None
 
+from ..constants import CAPTCHA_FILENAME
 from ..main import BaseOperation
 from ..utils.terminal import print_kitty_image, print_sixel_mage
 
@@ -98,6 +100,11 @@ class Operation(BaseOperation):
             "--sixel",
             action="store_true",
             help="Вывод капчи в sixel",
+        )
+        parser.add_argument(
+            "--captcha-file",
+            type=Path,
+            help=f"Куда сохранить картинку с капчей. По умолчанию {CAPTCHA_FILENAME} в каталоге профиля",  # noqa: E501
         )
 
     def run(self, tool: HHApplicantTool, args) -> int | None:
@@ -315,17 +322,24 @@ class Operation(BaseOperation):
             return
 
         args = self._args
-        if not (args.use_kitty or args.use_sixel):
-            raise RuntimeError(
-                "Требуется ввод капчи! Используйте --kitty или --sixel."
-            )
-
         img_bytes = await captcha_element.screenshot()
         print("\n[!] Требуется ввод капчи.")
+
         if args.use_kitty:
             print_kitty_image(img_bytes)
         elif args.use_sixel:
             print_sixel_mage(img_bytes)
+        else:
+            # Ни kitty, ни sixel не работают в cmd.exe, PowerShell и Windows
+            # Terminal, поэтому картинку просто кладем на диск. В Docker каталог
+            # профиля примонтирован, так что файл сразу виден на хосте
+            captcha_file = (
+                args.captcha_file or self._tool.config_path / CAPTCHA_FILENAME
+            )
+            captcha_file.parent.mkdir(parents=True, exist_ok=True)
+            captcha_file.write_bytes(img_bytes)
+            print(f"🖼️ Картинка сохранена: {captcha_file}")
+            print("    Откройте её любым просмотрщиком и введите текст ниже.")
 
         captcha_text = (
             await asyncio.to_thread(input, "Введите текст с картинки: ")
